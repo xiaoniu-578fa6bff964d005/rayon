@@ -7,7 +7,7 @@ use crate::util::leak;
 use crate::{
     ErrorKind, ExitHandler, PanicHandler, StartHandler, ThreadPoolBuildError, ThreadPoolBuilder,
 };
-use crossbeam_deque::{Steal, Stealer, Worker};
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::SegQueue;
 use std::any::Any;
 use std::cell::Cell;
@@ -220,7 +220,7 @@ impl Registry {
         let n_threads = builder.get_num_threads();
         let breadth_first = builder.get_breadth_first();
 
-        let (workers, stealers): (Vec<_>, Vec<_>) = (0..n_threads)
+        let (workers, stealer_injector_s): (Vec<_>, Vec<_>) = (0..n_threads)
             .map(|_| {
                 let worker = if breadth_first {
                     Worker::new_fifo()
@@ -229,12 +229,16 @@ impl Registry {
                 };
 
                 let stealer = worker.stealer();
-                (worker, stealer)
+                let injector = Injector::new();
+                (worker, (stealer, injector))
             })
             .unzip();
 
         let registry = Arc::new(Registry {
-            thread_infos: stealers.into_iter().map(ThreadInfo::new).collect(),
+            thread_infos: stealer_injector_s
+                .into_iter()
+                .map(|(stealer, injector)| ThreadInfo::new(stealer, injector))
+                .collect(),
             sleep: Sleep::new(),
             injected_jobs: SegQueue::new(),
             terminate_latch: CountLatch::new(),
@@ -368,6 +372,10 @@ impl Registry {
                 self.inject(&[job_ref]);
             }
         }
+    }
+
+    pub(super) fn push_to(&self, job_ref: JobRef, index: usize) {
+        self.thread_infos[index].injector.push(job_ref);
     }
 
     /// Push a job into the "external jobs" queue; it will be taken by
@@ -527,14 +535,18 @@ struct ThreadInfo {
 
     /// the "stealer" half of the worker's deque
     stealer: Stealer<JobRef>,
+
+    /// the "injector" half of the worker's deque
+    injector: Injector<JobRef>,
 }
 
 impl ThreadInfo {
-    fn new(stealer: Stealer<JobRef>) -> ThreadInfo {
+    fn new(stealer: Stealer<JobRef>, injector: Injector<JobRef>) -> ThreadInfo {
         ThreadInfo {
             primed: LockLatch::new(),
             stopped: LockLatch::new(),
             stealer,
+            injector,
         }
     }
 }
@@ -627,7 +639,22 @@ impl WorkerThread {
     /// bottom.
     #[inline]
     pub(super) unsafe fn take_local_job(&self) -> Option<JobRef> {
-        self.worker.pop()
+        if let Some(job) = self.worker.pop() {
+            return Some(job);
+        } else {
+            let injector = &self.registry.thread_infos[self.index].injector;
+            loop {
+                match injector.steal() {
+                    Steal::Empty => return None,
+                    Steal::Success(d) => {
+                        return Some(d);
+                    }
+                    Steal::Retry => {
+                        // should't happened since only this workerthread should consume from injector
+                    }
+                }
+            }
+        }
     }
 
     /// Wait until the latch is set. Try to keep busy by popping and

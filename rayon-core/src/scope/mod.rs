@@ -461,6 +461,22 @@ impl<'scope> Scope<'scope> {
             self.base.registry.inject_or_push(job_ref);
         }
     }
+
+    /// Spawns a job. The job is assigned to another worker and cannot be stolen.
+    pub fn spawn_into<BODY>(&self, body: BODY, index: usize)
+    where
+        BODY: FnOnce(&Scope<'scope>) + Send + 'scope,
+    {
+        self.base.increment();
+        unsafe {
+            let job_ref = Box::new(HeapJob::new(move || {
+                self.base.execute_job(move || body(self))
+            }))
+            .as_job_ref();
+
+            self.base.registry.push_to(job_ref, index)
+        }
+    }
 }
 
 impl<'scope> ScopeFifo<'scope> {
