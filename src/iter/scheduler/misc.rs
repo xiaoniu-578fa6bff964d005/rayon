@@ -91,6 +91,66 @@ where
     helper(positions, 0, producer, consumer)
 }
 
+fn static_partition_bridge_into<P, C, T>(
+    positions: &[usize],
+    indexes: &[usize],
+    producer: P,
+    consumer: C,
+) -> C::Result
+where
+    P: Producer<Item = T>,
+    C: Consumer<T>,
+{
+    assert_eq!(indexes.len(), positions.len() + 1);
+    let partitions = indexes.len();
+
+    let mut producers = Vec::with_capacity(partitions);
+    let mut consumers = Vec::with_capacity(partitions);
+    let mut reducers = Vec::with_capacity(partitions - 1);
+    let mut results = (0..partitions).map(|_| None).collect::<Vec<_>>();
+
+    let mut remain_producer = producer;
+    let mut remain_consumer = consumer;
+    let mut last_position = 0;
+    for position in positions.iter() {
+        let (left_producer, right_producer) = remain_producer.split_at(position - last_position);
+        producers.push(left_producer);
+        remain_producer = right_producer;
+        let (left_consumer, right_consumer, reducer) =
+            remain_consumer.split_at(position - last_position);
+        consumers.push(left_consumer);
+        remain_consumer = right_consumer;
+        reducers.push(reducer);
+        last_position = *position;
+    }
+    producers.push(remain_producer);
+    consumers.push(remain_consumer);
+
+    use crate::scope;
+    scope(|s| {
+        for (((producer, consumer), result), index) in producers
+            .into_iter()
+            .zip(consumers.into_iter())
+            .zip(results.iter_mut())
+            .zip(indexes.iter())
+        {
+            // s.spawn(move |_| *result = Some(producer.fold_with(consumer.into_folder()).complete()));
+            s.spawn_into(
+                move |_| *result = Some(producer.fold_with(consumer.into_folder()).complete()),
+                *index,
+            );
+        }
+    });
+
+    let mut results = results.into_iter();
+    let mut acc_result = results.next().unwrap().unwrap();
+    for (result, reducer) in results.zip(reducers.into_iter()) {
+        acc_result = reducer.reduce(acc_result, result.unwrap());
+    }
+
+    acc_result
+}
+
 /// Fixed length scheduler.
 /// Every tasks assigned to a thread will contain a fixed number of items,
 /// except for the last task which will possibly contain less.
@@ -117,7 +177,13 @@ impl Scheduler for FixedLengthScheduler {
         C: Consumer<T>,
     {
         let positions: Vec<_> = (0..len).step_by(self.fixed_length).skip(1).collect();
-        static_partition_bridge(&positions, producer, consumer)
+        // static_partition_bridge(&positions, producer, consumer)
+        use crate::current_num_threads;
+        let num_threads = current_num_threads();
+        let indexes: Vec<_> = (0..(positions.len() + 1))
+            .map(|i| i % num_threads)
+            .collect();
+        static_partition_bridge_into(&positions, &indexes, producer, consumer)
     }
 }
 
@@ -159,6 +225,8 @@ impl Scheduler for StaticScheduler {
             .map(|i| (i * full_chunks) / num_threads * self.chunk_size)
             .collect();
 
-        static_partition_bridge(&positions, producer, consumer)
+        // static_partition_bridge(&positions, producer, consumer)
+        let indexes: Vec<_> = (0..num_threads).collect();
+        static_partition_bridge_into(&positions, &indexes, producer, consumer)
     }
 }
